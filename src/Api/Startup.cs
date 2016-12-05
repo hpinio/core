@@ -23,6 +23,8 @@ using System.Linq;
 using Microsoft.AspNetCore.Mvc.Formatters;
 using Microsoft.Net.Http.Headers;
 using Newtonsoft.Json.Serialization;
+using AspNetCoreRateLimit;
+using Bit.Api.Middleware;
 
 namespace Bit.Api
 {
@@ -38,6 +40,7 @@ namespace Bit.Api
             if(env.IsDevelopment())
             {
                 builder.AddUserSecrets();
+                builder.AddApplicationInsightsSettings(developerMode: true);
             }
 
             builder.AddEnvironmentVariables();
@@ -49,6 +52,8 @@ namespace Bit.Api
 
         public void ConfigureServices(IServiceCollection services)
         {
+            services.AddApplicationInsightsTelemetry(Configuration);
+
             var provider = services.BuildServiceProvider();
 
             // Options
@@ -58,6 +63,8 @@ namespace Bit.Api
             var globalSettings = new GlobalSettings();
             ConfigurationBinder.Bind(Configuration.GetSection("GlobalSettings"), globalSettings);
             services.AddSingleton(s => globalSettings);
+            services.Configure<IpRateLimitOptions>(Configuration.GetSection("IpRateLimitOptions"));
+            services.Configure<IpRateLimitPolicies>(Configuration.GetSection("IpRateLimitPolicies"));
 
             // Repositories
             services.AddSingleton<IUserRepository, Repos.UserRepository>();
@@ -66,6 +73,13 @@ namespace Bit.Api
 
             // Context
             services.AddScoped<CurrentContext>();
+
+            // Caching
+            services.AddMemoryCache();
+
+            // Rate limiting
+            services.AddSingleton<IIpPolicyStore, MemoryCacheIpPolicyStore>();
+            services.AddSingleton<IRateLimitCounterStore, MemoryCacheRateLimitCounterStore>();
 
             // Identity
             services.AddTransient<ILookupNormalizer, LowerInvariantLookupNormalizer>();
@@ -119,11 +133,12 @@ namespace Bit.Api
             services.AddScoped<AuthenticatorTokenProvider>();
 
             // Services
-            services.AddSingleton<IMailService, MailService>();
+            services.AddSingleton<IMailService, SendGridMailService>();
             services.AddSingleton<ICipherService, CipherService>();
             services.AddScoped<IUserService, UserService>();
-            services.AddScoped<IPushService, PushService>();
+            services.AddScoped<IPushService, PushSharpPushService>();
             services.AddScoped<IDeviceService, DeviceService>();
+            services.AddScoped<IBlockIpService, AzureQueueBlockIpService>();
 
             // Cors
             services.AddCors(config =>
@@ -159,10 +174,32 @@ namespace Bit.Api
             if(!env.IsDevelopment())
             {
                 loggerFactory.AddLoggr(
-                    LogLevel.Error,
+                    (category, logLevel, eventId) =>
+                    {
+                        // Bad security stamp exception
+                        if(category == typeof(JwtBearerMiddleware).FullName && eventId.Id == 3 && logLevel == LogLevel.Error)
+                        {
+                            return false;
+                        }
+
+                        // IP blocks
+                        if(category == typeof(IpRateLimitMiddleware).FullName && logLevel >= LogLevel.Information)
+                        {
+                            return true;
+                        }
+
+                        return logLevel >= LogLevel.Error;
+                    },
                     globalSettings.Loggr.LogKey,
                     globalSettings.Loggr.ApiKey);
             }
+
+            // Rate limiting
+            app.UseMiddleware<CustomIpRateLimitMiddleware>();
+
+            // Insights
+            app.UseApplicationInsightsRequestTelemetry();
+            app.UseApplicationInsightsExceptionTelemetry();
 
             // Add static files to the request pipeline.
             app.UseStaticFiles();
